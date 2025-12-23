@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Training
+stlenc-training/
+final-model/
+wandb/
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+env/
