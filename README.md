@@ -1,6 +1,3 @@
-Here is the complete `README.md` file. You can copy this entire block and save it directly as a `.md` file in your repository.
-
-```markdown
 # STLEnc: Neural Signal Temporal Logic Encoder
 
 STLEnc is a Transformer-based encoder designed to map **Signal Temporal Logic (STL)** formulae into a continuous 1024-dimensional latent embedding space. 
@@ -125,3 +122,4 @@ If you use this work in your research, please cite:
 }
 
 ```
+
