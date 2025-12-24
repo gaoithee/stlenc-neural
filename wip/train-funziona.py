@@ -11,32 +11,38 @@ from transformers import AutoConfig, AutoModel, AutoTokenizer, TrainingArguments
 REPO_ID = "saracandu/stlenc"
 DATASET_ID = "saracandu/stl_formulae"
 MAX_LENGTH = 512
-SAFE_THRESHOLD = 500  
+SAFE_THRESHOLD = 500  # Soglia di sicurezza per i token
 OUTPUT_DIR = "./stlenc-training"
-HUB_MODEL_ID = "saracandu/stlenc-neural-checkpoints" # Nome della repo su HF
 
 def main():
     wandb.init(
-        project="STL-Encoder-Training",   
-        name="transformer-stl-hub-sync",
+        project="STL-Encoder-Training",  
+        name="transformer-stl-safe-threshold",
         job_type="train"
     )
 
+    print(f"Caricamento architettura da {REPO_ID}...")
     tokenizer = AutoTokenizer.from_pretrained(REPO_ID, trust_remote_code=True)
     config = AutoConfig.from_pretrained(REPO_ID, trust_remote_code=True)
     model = AutoModel.from_pretrained(REPO_ID, config=config, trust_remote_code=True)
 
+    print(f"Caricamento dataset {DATASET_ID}...")
     full_dataset = load_dataset(DATASET_ID)
+    
     raw_train = full_dataset["train"]
     raw_test = full_dataset["test"] if "test" in full_dataset else raw_train.train_test_split(test_size=0.1)["test"]
 
+    # --- PREPROCESSING MANUALE PER ALLINEAMENTO TOTALE ---
     def prepare_data(dataset, name=""):
         print(f"Filtraggio fisico {name}...")
         clean_list = []
         for i, ex in enumerate(dataset):
+            # Check lunghezza REALE (con token speciali)
             token_out = tokenizer(ex["formula"], add_special_tokens=True, truncation=False)
+            
             if len(token_out["input_ids"]) > SAFE_THRESHOLD:
                 continue
+
             try:
                 target = ex['embedding_1024']
                 if isinstance(target, str):
@@ -44,6 +50,7 @@ def main():
                 if target is None or len(target) != 1024:
                     continue
                 
+                # Padding manuale
                 ids = token_out["input_ids"]
                 mask = [1] * len(ids) + [0] * (MAX_LENGTH - len(ids))
                 padded_ids = ids + [tokenizer.pad_token_id] * (MAX_LENGTH - len(ids))
@@ -59,83 +66,58 @@ def main():
 
     train_processed = prepare_data(raw_train, "Train")
     test_processed = prepare_data(raw_test, "Eval")
+
     train_processed.set_format("torch")
     test_processed.set_format("torch")
 
-    # --- TRAINER CON ACCUMULATORI PESATI ---
-    class STLEncTrainer(Trainer):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            # Accumulatori per media pesata (per matchare perfettamente eval_loss)
-            self.eval_mse_sum = 0.0
-            self.eval_cos_sum = 0.0
-            self.eval_total_samples = 0
+    print(f"Dataset pronti. Train: {len(train_processed)} | Eval: {len(test_processed)}")
 
+    class STLEncTrainer(Trainer):
         def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
             labels = inputs.pop("labels")
             outputs = model(**inputs)
-            
             if not isinstance(outputs, torch.Tensor):
-                embeddings = outputs[0] if isinstance(outputs, tuple) else outputs.last_hidden_state
-            else:
-                embeddings = outputs
+                outputs = outputs[0] if isinstance(outputs, tuple) else outputs.last_hidden_state
             
-            if embeddings.dim() == 3:
-                embeddings = embeddings[:, 0, :]
+            # Pooling CLS
+            if outputs.dim() == 3:
+                outputs = outputs[:, 0, :]
             
-            loss = nn.functional.mse_loss(embeddings, labels)
-
-            if not model.training:
-                with torch.no_grad():
-                    batch_size = labels.size(0)
-                    self.eval_mse_sum += loss.detach().item() * batch_size
-                    self.eval_cos_sum += nn.functional.cosine_similarity(embeddings, labels, dim=1).sum().item()
-                    self.eval_total_samples += batch_size
-
-            return (loss, embeddings) if return_outputs else loss
+            loss = nn.functional.mse_loss(outputs, labels)
+            return (loss, outputs) if return_outputs else loss
 
     def compute_metrics(eval_pred):
-        if trainer.eval_total_samples == 0:
-            return {"mse_perfect_sync": 0, "cosine_similarity_sync": 0}
-
-        # Media pesata corretta
-        mse_final = trainer.eval_mse_sum / trainer.eval_total_samples
-        cos_final = trainer.eval_cos_sum / trainer.eval_total_samples
+        logits, labels = eval_pred
         
-        trainer.eval_mse_sum = 0.0
-        trainer.eval_cos_sum = 0.0
-        trainer.eval_total_samples = 0
-        
-        return {
-            "mse_perfect_sync": mse_final,
-            "cosine_similarity_sync": cos_final
-        }
+        # Sincronizzazione di emergenza (non dovrebbe servire con prepare_data)
+        if logits.shape[0] != labels.shape[0]:
+            ms = min(logits.shape[0], labels.shape[0])
+            logits, labels = logits[:ms], labels[:ms]
 
-    # --- CONFIGURAZIONE ARGOMENTI CON PUSH TO HUB ---
+        logits_t = torch.from_numpy(logits)
+        labels_t = torch.from_numpy(labels)
+        
+        if logits_t.dim() == 3:
+            logits_t = logits_t[:, 0, :]
+            
+        mse = nn.functional.mse_loss(logits_t, labels_t).item()
+        # cos = nn.CosineSimilarity(dim=1).mean(torch.from_numpy(logits), torch.from_numpy(labels)).mean().item()
+        # Nota: correggo l'uso della similarità per semplicità
+        cos_sim = nn.functional.cosine_similarity(logits_t, labels_t).mean().item()
+        
+        return {"mse": mse, "avg_cosine_similarity": cos_sim}
+
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
-        report_to="wandb",
+        report_to="wandb",                
         per_device_train_batch_size=16,
         per_device_eval_batch_size=16,
-        num_train_epochs=10,
+        num_train_epochs=5,
         learning_rate=5e-5,
         logging_steps=10,
-        
-        # Valutazione e Salvataggio Checkpoint
         eval_strategy="steps",
         eval_steps=100,
-        save_strategy="steps",
-        save_steps=1000,
-        save_total_limit=2,          # Tiene gli ultimi 2 localmente
-        load_best_model_at_end=True, # Carica il migliore basato su MSE
-        metric_for_best_model="mse_perfect_sync",
-        greater_is_better=False,
-        
-        # Push to Hub (Hugging Face)
-        push_to_hub=True,
-        hub_model_id=HUB_MODEL_ID,
-        hub_strategy="checkpoint",   # Carica i checkpoint man mano
-        
+        save_total_limit=1,
         fp16=torch.cuda.is_available(),
         label_names=["labels"],
         remove_unused_columns=False
@@ -147,18 +129,11 @@ def main():
         train_dataset=train_processed,
         eval_dataset=test_processed,
         compute_metrics=compute_metrics,
-        tokenizer=tokenizer # Necessario per il push corretto
     )
 
-    print(f"Dataset pronti. Eval size: {len(test_processed)}")
-    print(f"I checkpoint verranno pushanti su: https://huggingface.co/{HUB_MODEL_ID}")
-    
+    print("Inizio addestramento...")
     trainer.train()
-    
-    # Salvataggio e Push finale
-    trainer.save_model("./pushed-model")
-    trainer.push_to_hub(commit_message="Training complete - final model")
-    
+    trainer.save_model("./final-model")
     wandb.finish()
 
 if __name__ == "__main__":

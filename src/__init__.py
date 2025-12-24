@@ -1,2 +1,2 @@
-from configuration_stlenc import STLEncoderConfig
-from modeling_stlenc import STLEncoderModel
+from .configuration_stlenc import STLEncoderConfig
+from .modeling_stlenc import STLEncoderModel

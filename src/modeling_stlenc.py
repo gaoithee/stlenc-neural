@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from transformers import PreTrainedModel
-from configuration_stlenc import STLEncoderConfig
+from .configuration_stlenc import STLEncoderConfig
 
 class STLEncoderModel(PreTrainedModel):
     config_class = STLEncoderConfig

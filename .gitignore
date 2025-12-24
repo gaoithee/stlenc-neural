@@ -1,10 +1,13 @@
 # Python
 __pycache__/
 *.py[cod]
+python/
+=/
 
 # Training
 stlenc-training/
 final-model/
+pushed-model/
 wandb/
 .ipynb_checkpoints/
 

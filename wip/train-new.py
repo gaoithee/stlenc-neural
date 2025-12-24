@@ -11,14 +11,13 @@ from transformers import AutoConfig, AutoModel, AutoTokenizer, TrainingArguments
 REPO_ID = "saracandu/stlenc"
 DATASET_ID = "saracandu/stl_formulae"
 MAX_LENGTH = 512
-SAFE_THRESHOLD = 500  
+SAFE_THRESHOLD = 500 
 OUTPUT_DIR = "./stlenc-training"
-HUB_MODEL_ID = "saracandu/stlenc-neural-checkpoints" # Nome della repo su HF
 
 def main():
     wandb.init(
-        project="STL-Encoder-Training",   
-        name="transformer-stl-hub-sync",
+        project="STL-Encoder-Training",  
+        name="transformer-stl-perfect-sync",
         job_type="train"
     )
 
@@ -62,14 +61,13 @@ def main():
     train_processed.set_format("torch")
     test_processed.set_format("torch")
 
-    # --- TRAINER CON ACCUMULATORI PESATI ---
+    # --- TRAINER CON CALCOLO METRICHE ISTANTANEO ---
     class STLEncTrainer(Trainer):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            # Accumulatori per media pesata (per matchare perfettamente eval_loss)
-            self.eval_mse_sum = 0.0
-            self.eval_cos_sum = 0.0
-            self.eval_total_samples = 0
+            # Inizializziamo accumulatori per le metriche di valutazione
+            self.eval_mse_accumulator = []
+            self.eval_cos_accumulator = []
 
         def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
             labels = inputs.pop("labels")
@@ -85,57 +83,45 @@ def main():
             
             loss = nn.functional.mse_loss(embeddings, labels)
 
+            # Se siamo in modalità valutazione (model.training è False), 
+            # calcoliamo le metriche istantaneamente Batch per Batch
             if not model.training:
                 with torch.no_grad():
-                    batch_size = labels.size(0)
-                    self.eval_mse_sum += loss.detach().item() * batch_size
-                    self.eval_cos_sum += nn.functional.cosine_similarity(embeddings, labels, dim=1).sum().item()
-                    self.eval_total_samples += batch_size
+                    # Calcoliamo MSE e COS su questo specifico batch (già allineato!)
+                    current_mse = loss.detach().item()
+                    current_cos = nn.functional.cosine_similarity(embeddings, labels, dim=1).mean().item()
+                    self.eval_mse_accumulator.append(current_mse)
+                    self.eval_cos_accumulator.append(current_cos)
 
             return (loss, embeddings) if return_outputs else loss
 
     def compute_metrics(eval_pred):
-        if trainer.eval_total_samples == 0:
-            return {"mse_perfect_sync": 0, "cosine_similarity_sync": 0}
-
-        # Media pesata corretta
-        mse_final = trainer.eval_mse_sum / trainer.eval_total_samples
-        cos_final = trainer.eval_cos_sum / trainer.eval_total_samples
+        # Invece di usare eval_pred (che è disallineato), 
+        # prendiamo i valori che il Trainer ha accumulato batch per batch
+        # Accediamo all'istanza del trainer globale (un po' "hacky" ma risolutivo)
+        mse_final = sum(trainer.eval_mse_accumulator) / max(len(trainer.eval_mse_accumulator), 1)
+        cos_final = sum(trainer.eval_cos_accumulator) / max(len(trainer.eval_cos_accumulator), 1)
         
-        trainer.eval_mse_sum = 0.0
-        trainer.eval_cos_sum = 0.0
-        trainer.eval_total_samples = 0
+        # Resettiamo gli accumulatori per la prossima valutazione
+        trainer.eval_mse_accumulator = []
+        trainer.eval_cos_accumulator = []
         
         return {
             "mse_perfect_sync": mse_final,
             "cosine_similarity_sync": cos_final
         }
 
-    # --- CONFIGURAZIONE ARGOMENTI CON PUSH TO HUB ---
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
         report_to="wandb",
         per_device_train_batch_size=16,
         per_device_eval_batch_size=16,
-        num_train_epochs=10,
+        num_train_epochs=5,
         learning_rate=5e-5,
         logging_steps=10,
-        
-        # Valutazione e Salvataggio Checkpoint
         eval_strategy="steps",
         eval_steps=100,
-        save_strategy="steps",
-        save_steps=1000,
-        save_total_limit=2,          # Tiene gli ultimi 2 localmente
-        load_best_model_at_end=True, # Carica il migliore basato su MSE
-        metric_for_best_model="mse_perfect_sync",
-        greater_is_better=False,
-        
-        # Push to Hub (Hugging Face)
-        push_to_hub=True,
-        hub_model_id=HUB_MODEL_ID,
-        hub_strategy="checkpoint",   # Carica i checkpoint man mano
-        
+        save_total_limit=1,
         fp16=torch.cuda.is_available(),
         label_names=["labels"],
         remove_unused_columns=False
@@ -147,18 +133,11 @@ def main():
         train_dataset=train_processed,
         eval_dataset=test_processed,
         compute_metrics=compute_metrics,
-        tokenizer=tokenizer # Necessario per il push corretto
     )
 
-    print(f"Dataset pronti. Eval size: {len(test_processed)}")
-    print(f"I checkpoint verranno pushanti su: https://huggingface.co/{HUB_MODEL_ID}")
-    
+    print(f"Dataset pronti. Train: {len(train_processed)} | Eval: {len(test_processed)}")
     trainer.train()
-    
-    # Salvataggio e Push finale
-    trainer.save_model("./pushed-model")
-    trainer.push_to_hub(commit_message="Training complete - final model")
-    
+    trainer.save_model("./final-model")
     wandb.finish()
 
 if __name__ == "__main__":
